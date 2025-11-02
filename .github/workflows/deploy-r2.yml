@@ -679,6 +679,13 @@ jobs:
         # https://developers.cloudflare.com/rules/origin-rules/create-api/
 
       # --- Upsert ACCOUNT-level Redirect Rule: interwebshack.com → https://www.interwebshack.com (301) ---
+      # Why compose the URL in expression?
+      # • Avoids 'preserve_query_string' field compatibility issues
+      # • Explicitly keeps both path and query
+      # Expression notes:
+      # • cf.zone.name scopes to this zone only (safe when multiple zones share the account ruleset)
+      # • http.request.uri.path + http.request.uri.query give us the full request target
+      # 
       # WHY ACCOUNT-LEVEL + SCOPED?
       #  • Redirect rules live at account level, so this rule must be placed there.
       #  • To avoid affecting other zones in the account, we scope the expression with cf.zone.name.
@@ -709,11 +716,16 @@ jobs:
           RULE_REF="acct_redirect_apex_to_www"
           RULE_DESC="Account-level redirect apex → www (301) for ${ZONE_NAME}"
 
+          # Build a target URL that preserves path and query:
+          # concat("https://www.example.com", http.request.uri.path,
+          #        if(len(http.request.uri.query)>0, concat("?", http.request.uri.query), ""))
+          TARGET_EXPR="concat(\"https://${WWW_HOST}\", http.request.uri.path, if(len(http.request.uri.query) > 0, concat(\"?\", http.request.uri.query), \"\"))"
+
           desired_rule=$(jq -n \
-            --arg ref "$RULE_REF" \
+            --arg ref  "$RULE_REF" \
             --arg desc "$RULE_DESC" \
             --arg expr "$EXPR" \
-            --arg www "$WWW_HOST" \
+            --arg tgt  "$TARGET_EXPR" \
             '{
               ref: $ref,
               description: $desc,
@@ -722,16 +734,13 @@ jobs:
               action_parameters: {
                 from_value: {
                   status_code: 301,
-                  target_url: {
-                    # Keep path; preserve query separately
-                    expression: "concat(\"https://\", $www, http.request.uri.path)"
-                  }
-                },
-                preserve_query_string: true
+                  target_url: { expression: $tgt }
+                }
               }
             }')
 
-          echo "🧩 Desired redirect rule:"; echo "$desired_rule" | jq .
+          echo "🧩 Desired redirect rule:"
+          echo "$desired_rule" | jq .
 
           # Fetch current account redirect ruleset
           get_resp=$(curl -sS \
@@ -743,6 +752,8 @@ jobs:
             exit 1
           fi
           current_rules=$(echo "$get_resp" | jq '.result.rules // []')
+          current_count=$(echo "$current_rules" | jq 'length')
+          echo "📚 Existing rules in account ruleset: $current_count"
 
           # Merge: remove any previous rule with same ref, then append desired rule
           new_rules=$(jq --arg ref "$RULE_REF" --argjson desired "$desired_rule" -n \
@@ -751,7 +762,8 @@ jobs:
             ')
 
           put_payload=$(jq -n --argjson rules "$new_rules" '{ rules: $rules }')
-          echo "📦 PUT payload:"; echo "$put_payload" | jq .
+          echo "📦 PUT payload:"
+          echo "$put_payload" | jq .
 
           put_resp=$(curl -sS -w "\n%{http_code}" -X PUT \
             "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/rulesets/${RSET_ID}" \
@@ -770,9 +782,10 @@ jobs:
           echo "❌ Failed to upsert account-level redirect rule"
           echo "$body" | jq . 2>/dev/null || echo "$body"
           echo "🛠 Hints:"
-          echo " • Ensure token has Account → Rulesets/Transform Rules: Edit"
+          echo " • Ensure token has Account → Account Rulesets (a.k.a. Rulesets/Transform Rules): Edit"
           echo " • Ensure account ruleset ID is correct and exists"
-          echo " • Expressions must use cf.zone.name to safely scope to this zone"
+          echo " • No $-style variables in expressions; inline hostnames literally"
+          echo " • For query preservation, we compose it inside target_url.expression (no preserve_query_string needed)"
           exit 1
 
         # Docs: Origin Rules via Rulesets API (phase http_request_origin).

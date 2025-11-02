@@ -15,6 +15,8 @@ Add the following permissions to the token:
 
 | Permission Scope      | Permission Category                          | Permission Level | Why Needed                                             |
 |-----------------------|----------------------------------------------|------------------|--------------------------------------------------------|
+| **Account**           | **Account Rulesets**                         | Edit             | Needed for account-level Redirect Rules                |
+| **Account**           | **Bulk URL Redirects**                       | Edit             | Needed for account-level Redirect Rules                |
 | **Account**           | **Workers R2 Storage**                       | Edit             | Create/manage R2 buckets and uploads                   |
 | **Account**           | **Transform Rules**                          | Edit             | Manage zone rules needed for routing and automation    |
 | **Zone**              | **DNS**                                      | Edit             | Create and update DNS records automatically            |
