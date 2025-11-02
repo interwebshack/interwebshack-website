@@ -206,7 +206,7 @@ jobs:
           ZONE_ID: ${{ steps.zone.outputs.zone_id }}
           MANAGED_HOSTNAMES: "interwebshack.com www.interwebshack.com"
           # Set to 1 to actually delete; set to 0 for a dry run preview
-          CF_DRY_RUN: "1"
+          CF_DRY_RUN: "0"
           # Set to 1 if you ALSO want to delete MX/NS (NOT recommended)
           ALLOW_CRITICAL: "0"
         run: |
