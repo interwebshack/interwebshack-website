@@ -301,3 +301,66 @@ jobs:
 
           echo ""
           echo "🏁 DNS cleanup complete for: $MANAGED_HOSTNAMES"
+
+      # --- Ensure DNS records for apex exist (proxied placeholder) ---
+      # ⚠️ IMPORTANT: WHY WE USE A PLACEHOLDER RECORD
+      # Cloudflare will NOT apply Origin Rules unless a DNS record exists.
+      # For R2 static hosting (without a Worker or Pages), the DNS record is just a "proxy trigger".
+      #
+      # ✅ This A-record points to TEST-NET-1 (192.0.2.1) — a ROUTABLE-NOWHERE IP.
+      # ✅ Traffic NEVER reaches this IP.
+      # ✅ Cloudflare proxy intercepts and rewrites to R2 using an Origin Rule.
+      # ✅ This record does NOT get replaced later — it stays as a placeholder.
+      # ⚠️ Do NOT change it to your server IP — R2 has no IP origin.
+      #
+      # If you don't want placeholders, use a Worker fronting R2 or Cloudflare Pages instead.
+      - name: Ensure DNS — apex A (proxied placeholder)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+
+          echo "🌐 Ensuring DNS record exists for apex domain"
+          echo "📛 Domain: ${ZONE_NAME}"
+          echo "🧭 Zone ID: ${ZONE_ID}"
+          echo "➡️  Purpose: Placeholder A record (Cloudflare proxies request, Origin Rule sends to R2)"
+          echo "🏷️  Placeholder IP: 192.0.2.1 (TEST-NET-1 — safe, unused address)"
+
+          payload=$(jq -n \
+            --arg type "A" \
+            --arg name "${ZONE_NAME}" \
+            --arg content "192.0.2.1" \
+            --argjson proxied true \
+            '{type:$type,name:$name,content:$content,proxied:$proxied}')
+
+          echo "📦 Payload:"
+          echo "$payload" | jq .
+
+          response=$(curl -sS -w "\n%{http_code}" -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$payload" || true)
+
+          body=$(echo "$response" | sed '$d')
+          http_status=$(echo "$response" | tail -n1)
+
+          echo "📡 HTTP Status: $http_status"
+
+          success=$(echo "$body" | jq -r '.success')
+
+          if [[ "$success" == "true" ]]; then
+            echo "✅ Apex DNS placeholder created (proxy active for Origin Rule → R2)"
+            exit 0
+          fi
+
+          # Cloudflare error 81057 = record already exists
+          if echo "$body" | jq -r '.errors[]?.code // empty' | grep -q "81057"; then
+            echo "ℹ️ Placeholder record already exists — OK (idempotent)"
+            exit 0
+          fi
+
+          echo "❌ Failed to ensure apex placeholder record"
+          echo "$body" | jq . 2>/dev/null || echo "$body"
+          exit 1
