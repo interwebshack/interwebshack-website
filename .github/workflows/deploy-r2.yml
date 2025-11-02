@@ -150,6 +150,55 @@ jobs:
         # Docs: Create R2 bucket (API). 
         # https://developers.cloudflare.com/api/resources/r2/subresources/buckets/methods/create/
 
+      # --- Ensure R2 Custom Domain connected (makes bucket public over CDN) ---
+      - name: Ensure R2 Custom Domain (idempotent)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🌐 Ensuring R2 custom domain is attached to bucket"
+          echo "🪣 Bucket: ${R2_BUCKET}"
+          echo "🔗 Custom domain: ${R2_CUSTOM_DOMAIN}"
+          echo "👤 Account: ${CLOUDFLARE_ACCOUNT_ID}"
+          echo "🧭 Zone ID: ${{ steps.zone.outputs.zone_id }}"
+
+          payload=$(jq -n \
+            --arg domain "${R2_CUSTOM_DOMAIN}" \
+            --arg zoneId "${{ steps.zone.outputs.zone_id }}" \
+            '{domain: $domain, enabled: true, zoneId: $zoneId}')
+
+          echo "📦 Request payload:"
+          echo "$payload" | jq .
+
+          response=$(curl -sS -w "\n%{http_code}" -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${R2_BUCKET}/domains/custom" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$payload" || true)
+
+          body=$(echo "$response" | sed '$d')
+          http_status=$(echo "$response" | tail -n1)
+
+          echo "📡 Cloudflare API HTTP status: $http_status"
+
+          if [[ "$http_status" == "200" || "$http_status" == "201" ]]; then
+            echo "✅ Custom domain attached to bucket successfully"
+            exit 0
+          fi
+
+          if [[ "$http_status" == "409" ]]; then
+            echo "ℹ️ Custom domain already attached — continuing"
+            exit 0
+          fi
+
+          echo "❌ Failed to attach custom domain to R2 bucket"
+          echo "— Response body —"
+          echo "$body" | jq . 2>/dev/null || echo "$body"
+          exit 1
+
+      # Docs: Public buckets & custom domains.
+      # https://developers.cloudflare.com/r2/buckets/public-buckets/
+
       # --- Clean existing DNS records for managed hostnames (idempotent & verbose) ---
       - name: Clean DNS records for root + www
         shell: bash
@@ -252,52 +301,3 @@ jobs:
 
           echo ""
           echo "🏁 DNS cleanup complete for: $MANAGED_HOSTNAMES"
-
-      # --- Ensure R2 Custom Domain connected (makes bucket public over CDN) ---
-      - name: Ensure R2 Custom Domain (idempotent)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "🌐 Ensuring R2 custom domain is attached to bucket"
-          echo "🪣 Bucket: ${R2_BUCKET}"
-          echo "🔗 Custom domain: ${R2_CUSTOM_DOMAIN}"
-          echo "👤 Account: ${CLOUDFLARE_ACCOUNT_ID}"
-          echo "🧭 Zone ID: ${{ steps.zone.outputs.zone_id }}"
-
-          payload=$(jq -n \
-            --arg domain "${R2_CUSTOM_DOMAIN}" \
-            --arg zoneId "${{ steps.zone.outputs.zone_id }}" \
-            '{domain: $domain, enabled: true, zoneId: $zoneId}')
-
-          echo "📦 Request payload:"
-          echo "$payload" | jq .
-
-          response=$(curl -sS -w "\n%{http_code}" -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${R2_BUCKET}/domains/custom" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data "$payload" || true)
-
-          body=$(echo "$response" | sed '$d')
-          http_status=$(echo "$response" | tail -n1)
-
-          echo "📡 Cloudflare API HTTP status: $http_status"
-
-          if [[ "$http_status" == "200" || "$http_status" == "201" ]]; then
-            echo "✅ Custom domain attached to bucket successfully"
-            exit 0
-          fi
-
-          if [[ "$http_status" == "409" ]]; then
-            echo "ℹ️ Custom domain already attached — continuing"
-            exit 0
-          fi
-
-          echo "❌ Failed to attach custom domain to R2 bucket"
-          echo "— Response body —"
-          echo "$body" | jq . 2>/dev/null || echo "$body"
-          exit 1
-
-      # Docs: Public buckets & custom domains.
-      # https://developers.cloudflare.com/r2/buckets/public-buckets/
