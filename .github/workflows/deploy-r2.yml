@@ -608,159 +608,175 @@ jobs:
           echo "🏁 Origin Rules ruleset ensure step complete — ruleset is ready."
           echo "   Next step will insert/update rule to route apex + www → R2"
 
-      # --- Upsert Origin Rule for apex + www → R2 custom domain (idempotent, verbose, safe) ---
-      # This ensures a single "route" rule exists that rewrites origin for:
-      #   interwebshack.com and www.interwebshack.com
-      # to your R2 custom domain (host header + origin override).
+      # --- Ensure Redirect Rules ruleset exists (http_request_redirect) ---
+      # WHY THIS RULESET?
+      # We need to send users from the apex (interwebshack.com) → www.interwebshack.com.
       #
-      # Why:
-      #  • DNS placeholder only enables proxy; the real routing happens here.
-      #  • This rule tells Cloudflare to fetch from R2 instead of the placeholder.
+      # WHY NOT ORIGIN RULES?
+      # Cloudflare origin rules with host_header override require higher plan entitlements.
+      # We hit the error: "not entitled to use the HostHeader override".
       #
-      - name: Upsert Origin Rule for apex + www → R2 custom domain
+      # R2 already manages `www.interwebshack.com`. So the correct approach on this plan is:
+      #     apex → permanent 301 redirect → www
+      #
+      # This ruleset allows us to insert a redirect rule using Cloudflare's Rules Engine.
+      #
+      - name: Ensure Redirect Rules ruleset exists (http_request_redirect)
+        id: redirect_ruleset
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+
+          echo "🚦 Ensuring Redirect Rules ruleset exists for apex → www redirect"
+          echo "🧭 Zone ID: ${ZONE_ID}"
+          echo "📌 Phase: http_request_redirect (Cloudflare handles redirects here)"
+
+          list_resp=$(curl -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets")
+
+          if [[ "$(echo "$list_resp" | jq -r '.success')" != "true" ]]; then
+            echo "❌ Failed to list rulesets"
+            echo "$list_resp" | jq . || echo "$list_resp"
+            exit 1
+          fi
+
+          # Look for redirect phase ruleset
+          rid=$(echo "$list_resp" | jq -r '.result[] | select(.phase=="http_request_redirect") | .id // empty')
+
+          if [[ -n "$rid" ]]; then
+            echo "✅ Found existing redirect ruleset: $rid"
+          else
+            echo "➕ Creating redirect ruleset for apex→www redirect…"
+
+            create_payload='{
+              "name":"Redirect Rules",
+              "description":"Zone-level ruleset for apex→www redirect (R2 static hosting)",
+              "kind":"zone",
+              "phase":"http_request_redirect",
+              "rules":[]
+            }'
+
+            create_resp=$(curl -sS -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$create_payload")
+
+            if [[ "$(echo "$create_resp" | jq -r '.success')" != "true" ]]; then
+              echo "❌ Failed to create redirect ruleset"
+              echo "$create_resp" | jq . || echo "$create_resp"
+              exit 1
+            fi
+
+            rid=$(echo "$create_resp" | jq -r '.result.id')
+            echo "✅ Created redirect ruleset: $rid"
+          fi
+
+          # Export ruleset ID to next step
+          echo "redirect_ruleset_id=$rid" >> "$GITHUB_OUTPUT"
+
+        # Docs: Origin Rules via Rulesets API (phase http_request_origin).
+        # https://developers.cloudflare.com/rules/origin-rules/create-api/
+
+      # --- Upsert Redirect Rule: interwebshack.com → https://www.interwebshack.com (301) ---
+      # WHY THIS RULE?
+      # We enforce that the canonical site domain is `www.interwebshack.com`.
+      # R2 already serves www directly via custom domain mapping.
+      # Apex has to redirect because:
+      #   • Apex cannot CNAME to R2 (DNS standards)
+      #   • Origin Rules cannot override Host header on this plan
+      #
+      # RESULT:
+      #   http://interwebshack.com/*      → https://www.interwebshack.com/*
+      #   https://interwebshack.com/*     → https://www.interwebshack.com/*
+      #
+      # SEO BENEFIT:
+      #   301 = search engines consolidate indexing to one canonical domain.
+      #
+      - name: Upsert redirect rule apex → www (301)
         shell: bash
         run: |
           set -euo pipefail
 
           ZONE_ID="${{ steps.zone.outputs.zone_id }}"
-          RULESET_ID="${{ steps.ruleset.outputs.ruleset_id }}"
-          TARGET="${R2_CUSTOM_DOMAIN}"
+          RSET_ID="${{ steps.redirect_ruleset.outputs.redirect_ruleset_id }}"
+          APEX="${ZONE_NAME}"
+          WWW="www.${ZONE_NAME}"
 
-          echo "🚦 Upserting Origin Rule (route) in http_request_origin ruleset"
-          echo "🧭 Zone ID: ${ZONE_ID}"
-          echo "🆔 Ruleset ID: ${RULESET_ID}"
-          echo "🎯 R2 custom domain (target host): ${TARGET}"
+          echo "🔁 Ensuring permanent redirect:"
+          echo "   ${APEX} → ${WWW}"
+          echo "📎 Reason: Cloudflare plan does not include HostHeader override → using SEO-safe redirect"
+          echo "🌐 R2 serves www; apex is an alias via redirect"
 
-          # -------- Input validation --------
-          if [[ -z "${ZONE_ID}" || -z "${RULESET_ID}" || -z "${TARGET}" ]]; then
-            echo "❌ Missing required inputs. ZONE_ID, RULESET_ID, and R2_CUSTOM_DOMAIN must be set."
-            exit 1
-          fi
+          RULE_REF="redirect_apex_to_www"
+          RULE_DESC="Redirect apex to www (301)"
+          EXPR="http.host eq \"${APEX}\""
 
-          if ! [[ "${TARGET}" =~ ^[a-z0-9.-]+$ ]]; then
-            echo "❌ R2_CUSTOM_DOMAIN looks invalid: '${TARGET}'"
-            echo "   Must be a DNS hostname (lowercase letters, digits, dots, dashes)."
-            exit 1
-          fi
-
-          # Expression matching apex + www
-          EXPR='(http.host eq "interwebshack.com") or (http.host eq "www.interwebshack.com")'
-          RULE_REF="route_r2_interwebshack"
-          RULE_DESC="Route apex+www to R2 custom domain"
-
-          # Desired rule object for comparison
           desired_rule=$(jq -n \
-            --arg ref "${RULE_REF}" \
-            --arg desc "${RULE_DESC}" \
-            --arg expression "${EXPR}" \
-            --arg host "${TARGET}" \
+            --arg ref "$RULE_REF" \
+            --arg desc "$RULE_DESC" \
+            --arg expr "$EXPR" \
+            --arg www "$WWW" \
             '{
               ref: $ref,
               description: $desc,
-              expression: $expression,
-              action: "route",
+              expression: $expr,
+              action: "redirect",
               action_parameters: {
-                host_header: $host,
-                origin: { host: $host }
+                from_value: {
+                  status_code: 301,
+                  target_url: {
+                    expression: "concat(\"https://\", $www, http.request.uri.path)"
+                  }
+                },
+                preserve_query_string: true
               }
             }')
 
-          echo "🧩 Desired rule:"
+          echo "📦 Desired redirect rule:"
           echo "$desired_rule" | jq .
 
-          # -------- Fetch current ruleset (to inspect and merge) --------
-          echo "🔎 Fetching current ruleset to check existing rules…"
           get_resp=$(curl -sS \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets/${RULESET_ID}")
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets/${RSET_ID}")
 
-          get_ok=$(echo "$get_resp" | jq -r '.success // empty')
-          if [[ "$get_ok" != "true" ]]; then
-            echo "❌ Failed to fetch ruleset"
-            echo "$get_resp" | jq . 2>/dev/null || echo "$get_resp"
-            echo "🛠 Fix: Ensure token has Zone → Origin Rules / Transform Rules: Edit and zone access."
+          if [[ "$(echo "$get_resp" | jq -r '.success')" != "true" ]]; then
+            echo "❌ Failed to fetch redirect ruleset"
+            echo "$get_resp" | jq . || echo "$get_resp"
             exit 1
           fi
 
-          # Extract current rules array (or empty)
           current_rules=$(echo "$get_resp" | jq '.result.rules // []')
-          current_count=$(echo "$current_rules" | jq 'length')
-          echo "📚 Rules currently in ruleset: $current_count"
 
-          # Find any existing rule with our ref
-          existing_rule=$(echo "$current_rules" | jq --arg ref "$RULE_REF" '
-            .[] | select(.ref == $ref)
-          ')
-
-          if [[ -n "$existing_rule" ]]; then
-            echo "ℹ️ Found existing rule with ref=$RULE_REF. Checking if identical…"
-
-            # Build a minimal comparable view (action, expr, host_header, origin.host)
-            want_min=$(echo "$desired_rule" | jq '{action, expression, action_parameters: {host_header: .action_parameters.host_header, origin: {host: .action_parameters.origin.host}}}')
-            have_min=$(echo "$existing_rule" | jq '{action, expression, action_parameters: {host_header: .action_parameters.host_header, origin: {host: .action_parameters.origin.host}}}')
-
-            if diff=$(diff -u <(echo "$have_min") <(echo "$want_min")) ; then
-              echo "✅ Existing rule is identical. No update needed."
-              exit 0
-            else
-              echo "✏️ Existing rule differs from desired; will update."
-              echo "🔍 Diff (have → want):"
-              diff -u <(echo "$have_min") <(echo "$want_min") || true
-            fi
-          else
-            echo "➕ No existing rule with ref=$RULE_REF; will add it."
-          fi
-
-          # -------- Build new rules list: remove old ref (if any) and append desired rule --------
           new_rules=$(jq --arg ref "$RULE_REF" --argjson desired "$desired_rule" -n \
             --argjson current "$current_rules" '
               ($current | map(select(.ref != $ref))) + [ $desired ]
             ')
 
-          new_count=$(echo "$new_rules" | jq 'length')
-          echo "🧮 Rules after merge: $new_count (was $current_count)"
-          echo "📦 PUT payload (rules only):"
-          echo "$new_rules" | jq .
-
-          # -------- PUT update (only when needed) --------
           put_payload=$(jq -n --argjson rules "$new_rules" '{ rules: $rules }')
 
+          echo "📬 Uploading rule…"
+          echo "$put_payload" | jq .
+
           put_resp=$(curl -sS -w "\n%{http_code}" -X PUT \
-            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets/${RULESET_ID}" \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets/${RSET_ID}" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" \
             --data "$put_payload" || true)
 
-          put_body=$(echo "$put_resp" | sed '$d')
-          put_code=$(echo "$put_resp" | tail -n1)
+          body=$(echo "$put_resp" | sed '$d'); code=$(echo "$put_resp" | tail -n1)
+          echo "📡 PUT HTTP Status: $code"
 
-          echo "📡 PUT HTTP Status: $put_code"
-
-          if [[ "$(echo "$put_body" | jq -r '.success // empty')" == "true" ]]; then
-            echo "✅ Upserted Origin Rule successfully."
-            # Print a brief summary of the rule now present
-            echo "$put_body" | jq '
-              .result.rules[]
-              | select(.ref=="'"$RULE_REF"'")
-              | {ref, action, expression, action_parameters: {host_header: .action_parameters.host_header, origin: {host: .action_parameters.origin.host}}}
-            '
+          if [[ "$(echo "$body" | jq -r '.success')" == "true" ]]; then
+            echo "✅ Redirect rule ensured:"
+            echo "$body" | jq '.result.rules[] | select(.ref == "'"$RULE_REF"'")'
             exit 0
           fi
 
-          # Handle common errors more gracefully
-          err_code=$(echo "$put_body" | jq -r '.errors[0]?.code // empty')
-          err_msg=$(echo "$put_body" | jq -r '.errors[0]?.message // empty')
-
-          echo "❌ Failed to upsert Origin Rule"
-          echo "$put_body" | jq . 2>/dev/null || echo "$put_body"
-
-          echo "🛠 Hints:"
-          echo " • Confirm token has: Zone → Origin Rules / Transform Rules: Edit"
-          echo " • Confirm the ruleset exists and RULESET_ID is correct"
-          echo " • Ensure your payload is valid (hostnames, expression syntax)"
-          echo " • If other rules conflict, Cloudflare may reject; inspect existing rules"
-          echo " • You can try a minimal payload with only this rule if merge fails"
-
+          echo "❌ Failed to upsert redirect rule"
+          echo "$body" | jq . || echo "$body"
           exit 1
 
         # Docs: Origin Rules via Rulesets API (phase http_request_origin).
