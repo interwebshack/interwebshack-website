@@ -150,6 +150,109 @@ jobs:
         # Docs: Create R2 bucket (API). 
         # https://developers.cloudflare.com/api/resources/r2/subresources/buckets/methods/create/
 
+      # --- Clean existing DNS records for managed hostnames (idempotent & verbose) ---
+      - name: Clean DNS records for root + www
+        shell: bash
+        env:
+          ZONE_ID: ${{ steps.zone.outputs.zone_id }}
+          MANAGED_HOSTNAMES: "interwebshack.com www.interwebshack.com"
+          # Set to 1 to actually delete; set to 0 for a dry run preview
+          CF_DRY_RUN: "1"
+          # Set to 1 if you ALSO want to delete MX/NS (NOT recommended)
+          ALLOW_CRITICAL: "0"
+        run: |
+          set -euo pipefail
+
+          echo "🧹 Preparing to clean DNS records in zone: $ZONE_ID"
+          echo "🔧 Managed hostnames: $MANAGED_HOSTNAMES"
+          echo "🧪 Dry run mode: $CF_DRY_RUN (0=delete, 1=preview only)"
+          echo "🚨 Allow critical (MX/NS) deletion: $ALLOW_CRITICAL (0=no, 1=yes)"
+
+          # Helper: delete all records for a given name
+          delete_for_name() {
+            local name="$1"
+            echo ""
+            echo "🔎 Listing existing DNS records for: $name"
+
+            # Get up to 1000 records for this exact name
+            resp=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${name}&per_page=1000")
+
+            ok=$(echo "$resp" | jq -r '.success')
+            if [[ "$ok" != "true" ]]; then
+              echo "❌ Failed to list DNS records for ${name}"
+              echo "$resp" | jq . 2>/dev/null || echo "$resp"
+              exit 1
+            fi
+
+            count=$(echo "$resp" | jq '.result | length')
+            echo "📃 Found ${count} record(s) for ${name}"
+
+            if [[ "$count" -eq 0 ]]; then
+              echo "✅ Nothing to delete for ${name}"
+              return 0
+            fi
+
+            # Show a table of what we plan to delete
+            echo "🧾 Current records:"
+            echo "$resp" | jq -r '
+              .result[] | [.id, .type, .name, (.content|tostring), (if .proxied then "proxied" else "dns-only" end), (."ttl"|tostring)]
+              | @tsv
+            ' | awk -F'\t' 'BEGIN{printf("  %-37s %-6s %-35s %-40s %-10s %-6s\n","ID","TYPE","NAME","CONTENT","PROXY","TTL")} {printf("  %-37s %-6s %-35s %-40s %-10s %-6s\n",$1,$2,$3,$4,$5,$6)}'
+
+            # Filter which records to delete
+            if [[ "$ALLOW_CRITICAL" == "1" ]]; then
+              filter='.result[]'
+            else
+              # Exclude NS/MX by default (safer)
+              filter='.result[] | select(.type != "NS" and .type != "MX")'
+            fi
+
+            # Collect IDs to delete
+            mapfile -t ids < <(echo "$resp" | jq -r "${filter} | .id")
+
+            if [[ "${#ids[@]}" -eq 0 ]]; then
+              echo "🛡️ No deletable records found for ${name} with current safety filters."
+              return 0
+            fi
+
+            echo "🗑️  Will delete ${#ids[@]} record(s) for ${name}:"
+            echo "$resp" | jq -r "${filter} | [ .id, .type, .name, (.content|tostring) ] | @tsv" \
+              | awk -F'\t' '{printf("  id=%s type=%-5s name=%-35s content=%s\n",$1,$2,$3,$4)}'
+
+            if [[ "$CF_DRY_RUN" == "1" ]]; then
+              echo "🧪 Dry run enabled — not deleting."
+              return 0
+            fi
+
+            # Delete each record verbosely
+            for id in "${ids[@]}"; do
+              echo "➡️  Deleting record id=${id} ..."
+              del_resp=$(curl -sS -X DELETE \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${id}")
+
+              del_ok=$(echo "$del_resp" | jq -r '.success')
+              if [[ "$del_ok" == "true" ]]; then
+                echo "   ✅ Deleted id=${id}"
+              else
+                echo "   ❌ Failed to delete id=${id}"
+                echo "$del_resp" | jq . 2>/dev/null || echo "$del_resp"
+                exit 1
+              fi
+            done
+
+            echo "✅ Completed deletions for ${name}"
+          }
+
+          # Loop over requested hostnames
+          for host in $MANAGED_HOSTNAMES; do
+            delete_for_name "$host"
+          done
+
+          echo ""
+          echo "🏁 DNS cleanup complete for: $MANAGED_HOSTNAMES"
+
       # --- Ensure R2 Custom Domain connected (makes bucket public over CDN) ---
       - name: Ensure R2 Custom Domain (idempotent)
         shell: bash
