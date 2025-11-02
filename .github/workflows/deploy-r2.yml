@@ -389,6 +389,9 @@ jobs:
           echo "❌ Failed to ensure apex placeholder record"
           echo "$body" | jq . 2>/dev/null || echo "$body"
           exit 1
+        # Docs: Create DNS record. 
+        # https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/
+
 
       # --- Ensure DNS — www CNAME to apex (proxied placeholder) ---
       # If R2 custom-domain already created a www CNAME to *.r2.dev, we KEEP it and skip.
@@ -514,3 +517,93 @@ jobs:
           echo "❌ Failed to create www CNAME"
           echo "$post_body" | jq . 2>/dev/null || echo "$post_body"
           exit 1
+        # Docs: Create DNS record. 
+        # https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/
+
+      # --- Ensure an Origin Rules ruleset exists; then add rules to route apex + www to R2 ---
+      # Cloudflare Engine Logic:
+      #   DNS record -> CF Proxy -> Origin Rule -> R2 bucket
+      #
+      # Why we need this:
+      #  • R2 buckets have no IP (you can't point DNS directly)
+      #  • DNS just "activates" the proxy
+      #  • Origin Rules change the "origin" to the R2 bucket hostname
+      #
+      # This step ensures the `http_request_origin` phase ruleset exists.
+      #   - If it exists, we reuse it (idempotent)
+      #   - If it doesn't exist, we create it
+      #
+      # Phase explanation:
+      #   "http_request_origin" phase runs when Cloudflare chooses the origin to fetch from.
+      #   It will tell Cloudflare: "instead of placeholder IP, talk to R2"
+      #
+      - name: Ensure Origin Rules ruleset exists (http_request_origin)
+        id: ruleset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+
+          echo "🚦 Ensuring Origin Rules ruleset exists for zone"
+          echo "🧭 Zone ID: $ZONE_ID"
+          echo "🔁 Purpose: Create or fetch the 'http_request_origin' ruleset (used to route apex+www → R2)"
+
+          echo "🔎 Checking for existing ruleset in http_request_origin phase..."
+
+          list_resp=$(curl -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets")
+
+          list_ok=$(echo "$list_resp" | jq -r '.success // empty')
+
+          if [[ "$list_ok" != "true" ]]; then
+            echo "❌ Failed to list rulesets"
+            echo "$list_resp" | jq . 2>/dev/null || echo "$list_resp"
+            exit 1
+          fi
+
+          rid=$(echo "$list_resp" | jq -r '.result[] | select(.phase=="http_request_origin") | .id // empty')
+
+          if [[ -n "$rid" ]]; then
+            echo "✅ Found existing http_request_origin ruleset"
+            echo "🆔 Ruleset ID: $rid"
+          else
+            echo "⚠️ No existing http_request_origin ruleset found"
+            echo "➕ Creating new Origin Rules ruleset for this zone..."
+
+            create_payload='{
+              "name": "Origin Rules ruleset",
+              "description": "Zone-level ruleset for origin overrides (R2 static hosting)",
+              "kind": "zone",
+              "phase": "http_request_origin",
+              "rules": []
+            }'
+
+            echo "📦 Payload:"
+            echo "$create_payload" | jq .
+
+            create_resp=$(curl -sS -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$create_payload")
+
+            create_ok=$(echo "$create_resp" | jq -r '.success // empty')
+
+            if [[ "$create_ok" != "true" ]]; then
+              echo "❌ Failed to create Origin Rules ruleset"
+              echo "$create_resp" | jq . 2>/dev/null || echo "$create_resp"
+              exit 1
+            fi
+
+            rid=$(echo "$create_resp" | jq -r '.result.id')
+            echo "✅ Created new Origin Rules ruleset"
+            echo "🆔 Ruleset ID: $rid"
+          fi
+
+          echo "📤 Exporting ruleset_id to GitHub outputs"
+          echo "ruleset_id=$rid" >> "$GITHUB_OUTPUT"
+
+          echo "🏁 Origin Rules ruleset ensure step complete — ruleset is ready."
+          echo "   Next step will insert/update rule to route apex + www → R2"
