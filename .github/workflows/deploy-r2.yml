@@ -445,36 +445,36 @@ jobs:
 
           echo "🛠️  Writing Worker source (redirect-apex.js)…"
           cat > redirect-apex.js <<'JS'
-      export default {
-        async fetch(request) {
-          const url = new URL(request.url);
-          // Redirect ONLY the apex; leave www (and any others) untouched
-          if (url.hostname === "interwebshack.com") {
-            url.hostname = "www.interwebshack.com";
-            return Response.redirect(url.toString(), 301);
-          }
-          return fetch(request);
-        }
-      };
-      JS
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    // Redirect ONLY the apex; leave www (and any others) untouched
+    if (url.hostname === "interwebshack.com") {
+      url.hostname = "www.interwebshack.com";
+      return Response.redirect(url.toString(), 301);
+    }
+    return fetch(request);
+  }
+};
+JS
 
-          echo "🧾 Writing wrangler.toml (route attached at apex)…"
-          cat > wrangler.toml <<'TOML'
-      name = "redirect-apex"
-      main = "redirect-apex.js"
-      compatibility_date = "2024-10-01"
+    echo "🧾 Writing wrangler.toml (route attached at apex)…"
+    cat > wrangler.toml <<'TOML'
+name = "redirect-apex"
+main = "redirect-apex.js"
+compatibility_date = "2024-10-01"
 
-      routes = [
-        { pattern = "interwebshack.com/*", zone_name = "interwebshack.com" }
-      ]
-      TOML
+routes = [
+  { pattern = "interwebshack.com/*", zone_name = "interwebshack.com" }
+]
+TOML
 
-          echo "🚀 Deploying with Wrangler (uses CLOUDFLARE_API_TOKEN)…"
-          npx --yes wrangler@latest deploy --account-id "${CLOUDFLARE_ACCOUNT_ID}"
+    echo "🚀 Deploying with Wrangler (uses CLOUDFLARE_API_TOKEN)…"
+    npx --yes wrangler@latest deploy --account-id "${CLOUDFLARE_ACCOUNT_ID}"
 
-          echo "🔎 Verifying routes for this Worker…"
-          npx --yes wrangler@latest routes list --account-id "${CLOUDFLARE_ACCOUNT_ID}" \
-            | sed -n '1,200p'
+    echo "🔎 Verifying routes for this Worker…"
+    npx --yes wrangler@latest routes list --account-id "${CLOUDFLARE_ACCOUNT_ID}" \
+      | sed -n '1,200p'
 
 
 
