@@ -160,41 +160,41 @@ jobs:
           echo "🪣 Bucket: ${R2_BUCKET}"
           echo "🔗 Custom domain: ${R2_CUSTOM_DOMAIN}"
           echo "👤 Account: ${CLOUDFLARE_ACCOUNT_ID}"
+          echo "🧭 Zone ID: ${{ steps.zone.outputs.zone_id }}"
 
-          # Create/attach custom domain
+          payload=$(jq -n \
+            --arg domain "${R2_CUSTOM_DOMAIN}" \
+            --arg zoneId "${{ steps.zone.outputs.zone_id }}" \
+            '{domain: $domain, enabled: true, zoneId: $zoneId}')
+
+          echo "📦 Request payload:"
+          echo "$payload" | jq .
+
           response=$(curl -sS -w "\n%{http_code}" -X POST \
             "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${R2_BUCKET}/domains/custom" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data "{\"domain\":\"${R2_CUSTOM_DOMAIN}\"}" || true)
+            --data "$payload" || true)
 
           body=$(echo "$response" | sed '$d')
           http_status=$(echo "$response" | tail -n1)
 
           echo "📡 Cloudflare API HTTP status: $http_status"
 
-          # Success codes (varies by API; 200/201 are both fine)
           if [[ "$http_status" == "200" || "$http_status" == "201" ]]; then
             echo "✅ Custom domain attached to bucket successfully"
             exit 0
           fi
 
-          # Already exists
           if [[ "$http_status" == "409" ]]; then
             echo "ℹ️ Custom domain already attached — continuing"
             exit 0
           fi
 
-          # Other errors -> show full response for debugging
           echo "❌ Failed to attach custom domain to R2 bucket"
           echo "— Response body —"
           echo "$body" | jq . 2>/dev/null || echo "$body"
-
-          # Helpful hints for common issues
-          echo "🛠️  Hints:"
-          echo " • Ensure the domain is in your Cloudflare account and active"
-          echo " • Ensure the bucket exists and R2 is enabled on this account"
-          echo " • If required, create the DNS CNAME for ${R2_CUSTOM_DOMAIN}"
           exit 1
+
       # Docs: Public buckets & custom domains.
       # https://developers.cloudflare.com/r2/buckets/public-buckets/
