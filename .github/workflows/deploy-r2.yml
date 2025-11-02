@@ -1,0 +1,42 @@
+name: Deploy static site to Cloudflare R2 (apex + www)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      # --- Required Secrets (set in GitHub: Settings → Secrets and variables → Actions) ---
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}   # must allow: R2 Storage Write, DNS Write, Zone Transform/Origin Rules Write
+      R2_ACCESS_KEY_ID:      ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY:  ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET:             ${{ secrets.R2_BUCKET }}              # e.g., site-interwebshack-com
+      R2_CUSTOM_DOMAIN:      ${{ secrets.R2_CUSTOM_DOMAIN }}       # e.g., static.interwebshack.com
+
+      # --- Derived / Configurable ---
+      ZONE_NAME: interwebshack.com
+      SITE_DIR: site
+      INDEX_OBJECT: index.html
+      R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # If you have a static-site build step, run it and output to $SITE_DIR.
+      # - name: Build site
+      #   run: <build> && mv dist "$SITE_DIR"
+
+      - name: Sanity check local site folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d "$SITE_DIR" || { echo "Expected ./$SITE_DIR"; exit 1; }
+          test -f "$SITE_DIR/$INDEX_OBJECT" || { echo "Expected ./$SITE_DIR/$INDEX_OBJECT"; exit 1; }
