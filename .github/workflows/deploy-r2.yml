@@ -1,16 +1,23 @@
-name: Deploy static site to Cloudflare R2 (apex + www)
+name: Deploy static site to Cloudflare R2 (root + www via R2 + Worker redirect)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch: {}
 
-permissions:
-  contents: read
+# One deploy at a time (prevents races in DNS / rules / R2 ops)
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
+    # Standard GH token perms; CF auth is via CLOUDFLARE_API_TOKEN secret
+    permissions:
+      contents: read
+
     env:
       # --- Required Secrets (set in GitHub: Settings → Secrets and variables → Actions) ---
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -29,6 +36,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install tools (jq, curl, node)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          node --version || true
+          npm --version || true
 
       # If you have a static-site build step, run it and output to $SITE_DIR.
       # - name: Build site
@@ -326,7 +341,6 @@ jobs:
           echo ""
           echo "🏁 DNS cleanup complete for: $MANAGED_HOSTNAMES"
 
-
       # --- Ensure DNS records for apex exist (proxied placeholder) ---
       # ⚠️ IMPORTANT: WHY WE USE A PLACEHOLDER RECORD
       # Cloudflare will NOT apply Origin Rules unless a DNS record exists.
@@ -391,6 +405,88 @@ jobs:
           exit 1
         # Docs: Create DNS record. 
         # https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/
+
+      # --- (Optional) Ensure DNS — www CNAME to apex (proxied placeholder) ------
+      # If R2 custom-domain already created CNAME www -> *.r2.dev (proxied), SKIP creating your own www record.
+      # We simply respect the R2-managed record. If you want your own www->apex placeholder instead, you can add
+      # the idempotent 'respect R2-managed' step we drafted earlier.
+
+      # # --- Upload site to R2 (S3 API; verbose) ---------------------------------
+      # - name: Upload site to R2 (S3 API)
+      #   if: ${{ env.SITE_DIR != '' }}
+      #   shell: bash
+      #   env:
+      #     AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      #     AWS_EC2_METADATA_DISABLED: "true"
+      #   run: |
+      #     set -euo pipefail
+      #     echo "📤 Syncing $SITE_DIR → r2://$R2_BUCKET/"
+      #     # Install AWS CLI v2 quickly (or use preinstalled if present)
+      #     pipx install awscli || pip install --user awscli || true
+      #     aws --version
+
+      #     # Configure S3 endpoint for R2 (path-style is fine here)
+      #     aws s3 sync "$SITE_DIR/" "s3://$R2_BUCKET/" \
+      #       --endpoint-url "$R2_ENDPOINT" \
+      #       --delete
+
+      #     echo "✅ Upload complete."
+
+      # --- Deploy a tiny Worker that redirects the apex → www (301) ---
+      # Why this instead of Redirect Rules?
+      # • Works on all plans, no “entitlement” surprises
+      # • Clear behavior: only apex redirects; www is served by R2 (R2-managed CNAME)
+      # • Logs + routes are visible in Wrangler output
+      - name: Deploy Worker: redirect apex → www (301)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🛠️  Writing Worker source (redirect-apex.js)…"
+          cat > redirect-apex.js <<'JS'
+      export default {
+        async fetch(request) {
+          const url = new URL(request.url);
+          // Redirect ONLY the apex; leave www (and any others) untouched
+          if (url.hostname === "interwebshack.com") {
+            url.hostname = "www.interwebshack.com";
+            return Response.redirect(url.toString(), 301);
+          }
+          return fetch(request);
+        }
+      };
+      JS
+
+          echo "🧾 Writing wrangler.toml (route attached at apex)…"
+          cat > wrangler.toml <<'TOML'
+      name = "redirect-apex"
+      main = "redirect-apex.js"
+      compatibility_date = "2024-10-01"
+
+      routes = [
+        { pattern = "interwebshack.com/*", zone_name = "interwebshack.com" }
+      ]
+      TOML
+
+          echo "🚀 Deploying with Wrangler (uses CLOUDFLARE_API_TOKEN)…"
+          npx --yes wrangler@latest deploy --account-id "${CLOUDFLARE_ACCOUNT_ID}"
+
+          echo "🔎 Verifying routes for this Worker…"
+          npx --yes wrangler@latest routes list --account-id "${CLOUDFLARE_ACCOUNT_ID}" \
+            | sed -n '1,200p'
+
+
+
+
+
+
+
+
+
+
+
+
 
 
       # --- Ensure DNS — www CNAME to apex (proxied placeholder) ---
