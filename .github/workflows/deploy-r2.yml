@@ -608,117 +608,112 @@ jobs:
           echo "🏁 Origin Rules ruleset ensure step complete — ruleset is ready."
           echo "   Next step will insert/update rule to route apex + www → R2"
 
-      # --- Ensure Redirect Rules ruleset exists (http_request_redirect) ---
-      # WHY THIS RULESET?
-      # We need to send users from the apex (interwebshack.com) → www.interwebshack.com.
+      # --- Ensure Account-level Redirect Rules ruleset exists (http_request_redirect) ---
+      # WHY ACCOUNT-LEVEL?
+      #  • Cloudflare's "Redirect Rules" are implemented in the account-level phase: http_request_redirect
+      #  • Your earlier error ("phase ... not allowed at zone level") confirms this.
+      #  • We will create/fetch the account-level ruleset and then scope rules to your zone in expressions.
       #
-      # WHY NOT ORIGIN RULES?
-      # Cloudflare origin rules with host_header override require higher plan entitlements.
-      # We hit the error: "not entitled to use the HostHeader override".
+      # PERMISSIONS REQUIRED:
+      #  • Account → Rulesets / Transform Rules: Edit   (UI label varies)
       #
-      # R2 already manages `www.interwebshack.com`. So the correct approach on this plan is:
-      #     apex → permanent 301 redirect → www
-      #
-      # This ruleset allows us to insert a redirect rule using Cloudflare's Rules Engine.
-      #
-      - name: Ensure Redirect Rules ruleset exists (http_request_redirect)
-        id: redirect_ruleset
+      - name: Ensure Redirect Rules ruleset exists (account-level http_request_redirect)
+        id: acct_redirect_ruleset
         shell: bash
         run: |
           set -euo pipefail
-          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+          ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID}"
 
-          echo "🚦 Ensuring Redirect Rules ruleset exists for apex → www redirect"
-          echo "🧭 Zone ID: ${ZONE_ID}"
-          echo "📌 Phase: http_request_redirect (Cloudflare handles redirects here)"
+          echo "🚦 Ensuring ACCOUNT-level Redirect Rules ruleset exists"
+          echo "👤 Account ID: ${ACCOUNT_ID}"
+          echo "📌 Phase: http_request_redirect (account-level only)"
 
           list_resp=$(curl -sS \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets")
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/rulesets")
 
           if [[ "$(echo "$list_resp" | jq -r '.success')" != "true" ]]; then
-            echo "❌ Failed to list rulesets"
-            echo "$list_resp" | jq . || echo "$list_resp"
+            echo "❌ Failed to list account rulesets"
+            echo "$list_resp" | jq . 2>/dev/null || echo "$list_resp"
+            echo "🛠 Fix: Ensure your token has Account → Rulesets/Transform Rules: Edit"
             exit 1
           fi
 
-          # Look for redirect phase ruleset
           rid=$(echo "$list_resp" | jq -r '.result[] | select(.phase=="http_request_redirect") | .id // empty')
 
           if [[ -n "$rid" ]]; then
-            echo "✅ Found existing redirect ruleset: $rid"
+            echo "✅ Found existing account redirect ruleset: $rid"
           else
-            echo "➕ Creating redirect ruleset for apex→www redirect…"
+            echo "➕ Creating account redirect ruleset…"
 
             create_payload='{
-              "name":"Redirect Rules",
-              "description":"Zone-level ruleset for apex→www redirect (R2 static hosting)",
-              "kind":"zone",
-              "phase":"http_request_redirect",
-              "rules":[]
+              "name": "Account Redirect Rules",
+              "description": "Account-level ruleset for apex→www redirect (R2 static hosting)",
+              "kind": "root",
+              "phase": "http_request_redirect",
+              "rules": []
             }'
 
+            echo "📦 Payload:"; echo "$create_payload" | jq .
+
             create_resp=$(curl -sS -X POST \
-              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets" \
+              "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/rulesets" \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" \
               --data "$create_payload")
 
             if [[ "$(echo "$create_resp" | jq -r '.success')" != "true" ]]; then
-              echo "❌ Failed to create redirect ruleset"
-              echo "$create_resp" | jq . || echo "$create_resp"
+              echo "❌ Failed to create account redirect ruleset"
+              echo "$create_resp" | jq . 2>/dev/null || echo "$create_resp"
               exit 1
             fi
 
             rid=$(echo "$create_resp" | jq -r '.result.id')
-            echo "✅ Created redirect ruleset: $rid"
+            echo "✅ Created account redirect ruleset: $rid"
           fi
 
-          # Export ruleset ID to next step
-          echo "redirect_ruleset_id=$rid" >> "$GITHUB_OUTPUT"
+          echo "account_redirect_ruleset_id=$rid" >> "$GITHUB_OUTPUT"
+
 
         # Docs: Origin Rules via Rulesets API (phase http_request_origin).
         # https://developers.cloudflare.com/rules/origin-rules/create-api/
 
-      # --- Upsert Redirect Rule: interwebshack.com → https://www.interwebshack.com (301) ---
-      # WHY THIS RULE?
-      # We enforce that the canonical site domain is `www.interwebshack.com`.
-      # R2 already serves www directly via custom domain mapping.
-      # Apex has to redirect because:
-      #   • Apex cannot CNAME to R2 (DNS standards)
-      #   • Origin Rules cannot override Host header on this plan
+      # --- Upsert ACCOUNT-level Redirect Rule: interwebshack.com → https://www.interwebshack.com (301) ---
+      # WHY ACCOUNT-LEVEL + SCOPED?
+      #  • Redirect rules live at account level, so this rule must be placed there.
+      #  • To avoid affecting other zones in the account, we scope the expression with cf.zone.name.
       #
-      # RESULT:
-      #   http://interwebshack.com/*      → https://www.interwebshack.com/*
-      #   https://interwebshack.com/*     → https://www.interwebshack.com/*
+      # FINAL BEHAVIOR:
+      #   http://interwebshack.com/*   → https://www.interwebshack.com/*
+      #   https://interwebshack.com/*  → https://www.interwebshack.com/*
       #
-      # SEO BENEFIT:
-      #   301 = search engines consolidate indexing to one canonical domain.
+      # PERMISSIONS REQUIRED:
+      #  • Account → Rulesets / Transform Rules: Edit
       #
-      - name: Upsert redirect rule apex → www (301)
+      - name: Upsert account-level redirect rule apex → www (301)
         shell: bash
         run: |
           set -euo pipefail
 
-          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
-          RSET_ID="${{ steps.redirect_ruleset.outputs.redirect_ruleset_id }}"
-          APEX="${ZONE_NAME}"
-          WWW="www.${ZONE_NAME}"
+          ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID}"
+          ZONE_NAME="${ZONE_NAME}"
+          RSET_ID="${{ steps.acct_redirect_ruleset.outputs.account_redirect_ruleset_id }}"
+          WWW_HOST="www.${ZONE_NAME}"
 
-          echo "🔁 Ensuring permanent redirect:"
-          echo "   ${APEX} → ${WWW}"
-          echo "📎 Reason: Cloudflare plan does not include HostHeader override → using SEO-safe redirect"
-          echo "🌐 R2 serves www; apex is an alias via redirect"
+          echo "🔁 Ensuring account-level redirect for ${ZONE_NAME} → ${WWW_HOST}"
+          echo "👤 Account ID: ${ACCOUNT_ID}"
+          echo "🆔 Account Redirect Ruleset ID: ${RSET_ID}"
 
-          RULE_REF="redirect_apex_to_www"
-          RULE_DESC="Redirect apex to www (301)"
-          EXPR="http.host eq \"${APEX}\""
+          # Scope to THIS zone only (avoid impacting other domains in the account)
+          EXPR="(cf.zone.name eq \"${ZONE_NAME}\") and (http.host eq \"${ZONE_NAME}\")"
+          RULE_REF="acct_redirect_apex_to_www"
+          RULE_DESC="Account-level redirect apex → www (301) for ${ZONE_NAME}"
 
           desired_rule=$(jq -n \
             --arg ref "$RULE_REF" \
             --arg desc "$RULE_DESC" \
             --arg expr "$EXPR" \
-            --arg www "$WWW" \
+            --arg www "$WWW_HOST" \
             '{
               ref: $ref,
               description: $desc,
@@ -728,6 +723,7 @@ jobs:
                 from_value: {
                   status_code: 301,
                   target_url: {
+                    # Keep path; preserve query separately
                     expression: "concat(\"https://\", $www, http.request.uri.path)"
                   }
                 },
@@ -735,48 +731,48 @@ jobs:
               }
             }')
 
-          echo "📦 Desired redirect rule:"
-          echo "$desired_rule" | jq .
+          echo "🧩 Desired redirect rule:"; echo "$desired_rule" | jq .
 
+          # Fetch current account redirect ruleset
           get_resp=$(curl -sS \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets/${RSET_ID}")
-
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/rulesets/${RSET_ID}")
           if [[ "$(echo "$get_resp" | jq -r '.success')" != "true" ]]; then
-            echo "❌ Failed to fetch redirect ruleset"
-            echo "$get_resp" | jq . || echo "$get_resp"
+            echo "❌ Failed to fetch account redirect ruleset"
+            echo "$get_resp" | jq . 2>/dev/null || echo "$get_resp"
             exit 1
           fi
-
           current_rules=$(echo "$get_resp" | jq '.result.rules // []')
 
+          # Merge: remove any previous rule with same ref, then append desired rule
           new_rules=$(jq --arg ref "$RULE_REF" --argjson desired "$desired_rule" -n \
             --argjson current "$current_rules" '
               ($current | map(select(.ref != $ref))) + [ $desired ]
             ')
 
           put_payload=$(jq -n --argjson rules "$new_rules" '{ rules: $rules }')
-
-          echo "📬 Uploading rule…"
-          echo "$put_payload" | jq .
+          echo "📦 PUT payload:"; echo "$put_payload" | jq .
 
           put_resp=$(curl -sS -w "\n%{http_code}" -X PUT \
-            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets/${RSET_ID}" \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/rulesets/${RSET_ID}" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" \
             --data "$put_payload" || true)
-
           body=$(echo "$put_resp" | sed '$d'); code=$(echo "$put_resp" | tail -n1)
           echo "📡 PUT HTTP Status: $code"
 
           if [[ "$(echo "$body" | jq -r '.success')" == "true" ]]; then
-            echo "✅ Redirect rule ensured:"
-            echo "$body" | jq '.result.rules[] | select(.ref == "'"$RULE_REF"'")'
+            echo "✅ Account-level redirect rule ensured:"
+            echo "$body" | jq '.result.rules[] | select(.ref=="'"$RULE_REF"'")'
             exit 0
           fi
 
-          echo "❌ Failed to upsert redirect rule"
-          echo "$body" | jq . || echo "$body"
+          echo "❌ Failed to upsert account-level redirect rule"
+          echo "$body" | jq . 2>/dev/null || echo "$body"
+          echo "🛠 Hints:"
+          echo " • Ensure token has Account → Rulesets/Transform Rules: Edit"
+          echo " • Ensure account ruleset ID is correct and exists"
+          echo " • Expressions must use cf.zone.name to safely scope to this zone"
           exit 1
 
         # Docs: Origin Rules via Rulesets API (phase http_request_origin).
