@@ -199,16 +199,14 @@ jobs:
       # Docs: Public buckets & custom domains.
       # https://developers.cloudflare.com/r2/buckets/public-buckets/
 
-      # --- Clean existing DNS records for managed hostnames (skip R2-managed)(idempotent & verbose) ---
+      # --- Clean existing DNS records for managed hostnames (skip R2-managed) (idempotent & verbose) ---
       - name: Clean DNS records for root + www
         shell: bash
         env:
           ZONE_ID: ${{ steps.zone.outputs.zone_id }}
           MANAGED_HOSTNAMES: "interwebshack.com www.interwebshack.com"
-          # Set to 1 to actually delete; set to 0 for a dry run preview
-          CF_DRY_RUN: "0"
-          # Set to 1 if you ALSO want to delete MX/NS (NOT recommended)
-          ALLOW_CRITICAL: "0"
+          CF_DRY_RUN: "0"        # 1 = preview only, 0 = actually delete
+          ALLOW_CRITICAL: "0"    # 1 = also delete NS/MX (NOT recommended)
         run: |
           set -euo pipefail
 
@@ -218,11 +216,14 @@ jobs:
           echo "🚫 Skip records auto-managed by R2 (CNAME → *.r2.dev)"
           echo "🚨 Allow critical (MX/NS) deletion: $ALLOW_CRITICAL (0=no, 1=yes)"
 
-          # Helper: Determines if record is managed.
+          # Normalize ALLOW_CRITICAL into a number for jq (0 or 1)
+          allow_critical_num=0
+          [[ "${ALLOW_CRITICAL}" == "1" ]] && allow_critical_num=1
+
+          # Helper: determines if a record is R2-managed (CNAME -> *.r2.dev)
           is_r2_managed() {
             # Args: TYPE NAME CONTENT
             local t="$1" n="$2" c="$3"
-            # R2 custom-domain creates a proxied CNAME whose content ends with r2.dev
             if [[ "$t" == "CNAME" && "$c" =~ \.r2\.dev$ ]]; then
               return 0
             fi
@@ -235,7 +236,6 @@ jobs:
             echo ""
             echo "🔎 Listing existing DNS records for: $name"
 
-            # Get up to 1000 records for this exact name
             resp=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${name}&per_page=1000")
 
@@ -256,17 +256,21 @@ jobs:
 
             echo "🧾 Current records:"
             echo "$resp" | jq -r '
-              .result[] | [.id, .type, .name, (.content|tostring), (if .proxied then "proxied" else "dns-only" end), (."ttl"|tostring)]
+              .result[] | [.id, .type, .name, (.content|tostring),
+                            (if .proxied then "proxied" else "dns-only" end),
+                            (."ttl"|tostring)]
               | @tsv
             ' | awk -F'\t' 'BEGIN{printf("  %-37s %-6s %-35s %-40s %-10s %-6s\n","ID","TYPE","NAME","CONTENT","PROXY","TTL")} {printf("  %-37s %-6s %-35s %-40s %-10s %-6s\n",$1,$2,$3,$4,$5,$6)}'
 
-            # Build list of deletable IDs (exclude NS/MX unless allowed; exclude *.r2.dev CNAMEs)
+            # Build list of deletable IDs:
+            # - exclude NS/MX unless allow_critical_num==1
+            # - exclude CNAMEs to *.r2.dev (auto-managed by R2)
             mapfile -t ids < <(
-              echo "$resp" | jq -r '
+              echo "$resp" | jq --argjson allow_crit ${allow_critical_num} -r '
                 .result[]
-                | select('"$([ "$ALLOW_CRITICAL" = "1" ] && echo 'true' || echo '.type != "NS" and .type != "MX"') "'
-                ')
-                | [.id, .type, .name, (.content|tostring)] | @tsv
+                | select( ($allow_crit==1) or (.type!="NS" and .type!="MX") )
+                | [.id, .type, .name, (.content|tostring)]
+                | @tsv
               ' | while IFS=$'\t' read -r id type rname content; do
                     if is_r2_managed "$type" "$rname" "$content"; then
                       echo "🛡️  Skipping R2-managed record (will not delete): type=$type name=$rname content=$content" >&2
@@ -321,6 +325,7 @@ jobs:
 
           echo ""
           echo "🏁 DNS cleanup complete for: $MANAGED_HOSTNAMES"
+
 
       # --- Ensure DNS records for apex exist (proxied placeholder) ---
       # ⚠️ IMPORTANT: WHY WE USE A PLACEHOLDER RECORD
