@@ -40,3 +40,18 @@ jobs:
           set -euo pipefail
           test -d "$SITE_DIR" || { echo "Expected ./$SITE_DIR"; exit 1; }
           test -f "$SITE_DIR/$INDEX_OBJECT" || { echo "Expected ./$SITE_DIR/$INDEX_OBJECT"; exit 1; }
+
+      # --- Get zone_id for interwebshack.com ---
+      - name: Resolve Cloudflare zone_id
+        id: zone
+        shell: bash
+        run: |
+          set -euo pipefail
+          zone_json=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones?name=${ZONE_NAME}")
+          ok=$(echo "$zone_json" | jq -r '.success')
+          test "$ok" = "true"
+          zone_id=$(echo "$zone_json" | jq -r '.result[0].id')
+          echo "zone_id=$zone_id" >> "$GITHUB_OUTPUT"
+        # Docs: List Zones (get zone_id). 
+        # https://developers.cloudflare.com/api/resources/zones/methods/list/
