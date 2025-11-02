@@ -17,7 +17,7 @@ jobs:
       CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}   # must allow: R2 Storage Write, DNS Write, Zone Transform/Origin Rules Write
       R2_ACCESS_KEY_ID:      ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY:  ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET:             ${{ secrets.R2_BUCKET }}              # e.g., site-interwebshack-com
+      R2_BUCKET:             ${{ secrets.R2_BUCKET }}              # e.g., site-interwebshack-com-<hash>
       R2_CUSTOM_DOMAIN:      ${{ secrets.R2_CUSTOM_DOMAIN }}       # e.g., static.interwebshack.com
 
       # --- Derived / Configurable ---
@@ -109,3 +109,43 @@ jobs:
 
         # Docs: List Zones (get zone_id). 
         # https://developers.cloudflare.com/api/resources/zones/methods/list/
+
+      # --- Ensure R2 bucket exists ---
+      - name: Ensure R2 bucket (idempotent)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🪣 Ensuring R2 bucket exists"
+          echo "📂 Bucket name: $R2_BUCKET"
+          echo "👤 Account: $CLOUDFLARE_ACCOUNT_ID"
+
+          # Attempt to create the bucket
+          response=$(curl -sS -w "\n%{http_code}" -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "{\"name\":\"${R2_BUCKET}\"}" || true)
+
+          body=$(echo "$response" | sed '$d')
+          http_status=$(echo "$response" | tail -n1)
+
+          echo "📡 Cloudflare API HTTP status: $http_status"
+
+          # 200 = created, 201 = created (depending on API), 409 = already exists
+          if [[ "$http_status" == "200" || "$http_status" == "201" ]]; then
+            echo "✅ Bucket created successfully (or already existed and returned success)"
+            exit 0
+          fi
+
+          if [[ "$http_status" == "409" ]]; then
+            echo "ℹ️ Bucket already exists — continuing"
+            exit 0
+          fi
+
+          echo "❌ Failed to create bucket. Full Cloudflare response:"
+          echo "$body" | jq || echo "$body"
+          exit 1
+
+        # Docs: Create R2 bucket (API). 
+        # https://developers.cloudflare.com/api/resources/r2/subresources/buckets/methods/create/
