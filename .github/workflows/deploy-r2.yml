@@ -607,3 +607,161 @@ jobs:
 
           echo "🏁 Origin Rules ruleset ensure step complete — ruleset is ready."
           echo "   Next step will insert/update rule to route apex + www → R2"
+
+      # --- Upsert Origin Rule for apex + www → R2 custom domain (idempotent, verbose, safe) ---
+      # This ensures a single "route" rule exists that rewrites origin for:
+      #   interwebshack.com and www.interwebshack.com
+      # to your R2 custom domain (host header + origin override).
+      #
+      # Why:
+      #  • DNS placeholder only enables proxy; the real routing happens here.
+      #  • This rule tells Cloudflare to fetch from R2 instead of the placeholder.
+      #
+      - name: Upsert Origin Rule for apex + www → R2 custom domain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+          RULESET_ID="${{ steps.ruleset.outputs.ruleset_id }}"
+          TARGET="${R2_CUSTOM_DOMAIN}"
+
+          echo "🚦 Upserting Origin Rule (route) in http_request_origin ruleset"
+          echo "🧭 Zone ID: ${ZONE_ID}"
+          echo "🆔 Ruleset ID: ${RULESET_ID}"
+          echo "🎯 R2 custom domain (target host): ${TARGET}"
+
+          # -------- Input validation --------
+          if [[ -z "${ZONE_ID}" || -z "${RULESET_ID}" || -z "${TARGET}" ]]; then
+            echo "❌ Missing required inputs. ZONE_ID, RULESET_ID, and R2_CUSTOM_DOMAIN must be set."
+            exit 1
+          fi
+
+          if ! [[ "${TARGET}" =~ ^[a-z0-9.-]+$ ]]; then
+            echo "❌ R2_CUSTOM_DOMAIN looks invalid: '${TARGET}'"
+            echo "   Must be a DNS hostname (lowercase letters, digits, dots, dashes)."
+            exit 1
+          fi
+
+          # Expression matching apex + www
+          EXPR='(http.host eq "interwebshack.com") or (http.host eq "www.interwebshack.com")'
+          RULE_REF="route_r2_interwebshack"
+          RULE_DESC="Route apex+www to R2 custom domain"
+
+          # Desired rule object for comparison
+          desired_rule=$(jq -n \
+            --arg ref "${RULE_REF}" \
+            --arg desc "${RULE_DESC}" \
+            --arg expression "${EXPR}" \
+            --arg host "${TARGET}" \
+            '{
+              ref: $ref,
+              description: $desc,
+              expression: $expression,
+              action: "route",
+              action_parameters: {
+                host_header: $host,
+                origin: { host: $host }
+              }
+            }')
+
+          echo "🧩 Desired rule:"
+          echo "$desired_rule" | jq .
+
+          # -------- Fetch current ruleset (to inspect and merge) --------
+          echo "🔎 Fetching current ruleset to check existing rules…"
+          get_resp=$(curl -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets/${RULESET_ID}")
+
+          get_ok=$(echo "$get_resp" | jq -r '.success // empty')
+          if [[ "$get_ok" != "true" ]]; then
+            echo "❌ Failed to fetch ruleset"
+            echo "$get_resp" | jq . 2>/dev/null || echo "$get_resp"
+            echo "🛠 Fix: Ensure token has Zone → Origin Rules / Transform Rules: Edit and zone access."
+            exit 1
+          fi
+
+          # Extract current rules array (or empty)
+          current_rules=$(echo "$get_resp" | jq '.result.rules // []')
+          current_count=$(echo "$current_rules" | jq 'length')
+          echo "📚 Rules currently in ruleset: $current_count"
+
+          # Find any existing rule with our ref
+          existing_rule=$(echo "$current_rules" | jq --arg ref "$RULE_REF" '
+            .[] | select(.ref == $ref)
+          ')
+
+          if [[ -n "$existing_rule" ]]; then
+            echo "ℹ️ Found existing rule with ref=$RULE_REF. Checking if identical…"
+
+            # Build a minimal comparable view (action, expr, host_header, origin.host)
+            want_min=$(echo "$desired_rule" | jq '{action, expression, action_parameters: {host_header: .action_parameters.host_header, origin: {host: .action_parameters.origin.host}}}')
+            have_min=$(echo "$existing_rule" | jq '{action, expression, action_parameters: {host_header: .action_parameters.host_header, origin: {host: .action_parameters.origin.host}}}')
+
+            if diff=$(diff -u <(echo "$have_min") <(echo "$want_min")) ; then
+              echo "✅ Existing rule is identical. No update needed."
+              exit 0
+            else
+              echo "✏️ Existing rule differs from desired; will update."
+              echo "🔍 Diff (have → want):"
+              diff -u <(echo "$have_min") <(echo "$want_min") || true
+            fi
+          else
+            echo "➕ No existing rule with ref=$RULE_REF; will add it."
+          fi
+
+          # -------- Build new rules list: remove old ref (if any) and append desired rule --------
+          new_rules=$(jq --arg ref "$RULE_REF" --argjson desired "$desired_rule" -n \
+            --argjson current "$current_rules" '
+              ($current | map(select(.ref != $ref))) + [ $desired ]
+            ')
+
+          new_count=$(echo "$new_rules" | jq 'length')
+          echo "🧮 Rules after merge: $new_count (was $current_count)"
+          echo "📦 PUT payload (rules only):"
+          echo "$new_rules" | jq .
+
+          # -------- PUT update (only when needed) --------
+          put_payload=$(jq -n --argjson rules "$new_rules" '{ rules: $rules }')
+
+          put_resp=$(curl -sS -w "\n%{http_code}" -X PUT \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/rulesets/${RULESET_ID}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$put_payload" || true)
+
+          put_body=$(echo "$put_resp" | sed '$d')
+          put_code=$(echo "$put_resp" | tail -n1)
+
+          echo "📡 PUT HTTP Status: $put_code"
+
+          if [[ "$(echo "$put_body" | jq -r '.success // empty')" == "true" ]]; then
+            echo "✅ Upserted Origin Rule successfully."
+            # Print a brief summary of the rule now present
+            echo "$put_body" | jq '
+              .result.rules[]
+              | select(.ref=="'"$RULE_REF"'")
+              | {ref, action, expression, action_parameters: {host_header: .action_parameters.host_header, origin: {host: .action_parameters.origin.host}}}
+            '
+            exit 0
+          fi
+
+          # Handle common errors more gracefully
+          err_code=$(echo "$put_body" | jq -r '.errors[0]?.code // empty')
+          err_msg=$(echo "$put_body" | jq -r '.errors[0]?.message // empty')
+
+          echo "❌ Failed to upsert Origin Rule"
+          echo "$put_body" | jq . 2>/dev/null || echo "$put_body"
+
+          echo "🛠 Hints:"
+          echo " • Confirm token has: Zone → Origin Rules / Transform Rules: Edit"
+          echo " • Confirm the ruleset exists and RULESET_ID is correct"
+          echo " • Ensure your payload is valid (hostnames, expression syntax)"
+          echo " • If other rules conflict, Cloudflare may reject; inspect existing rules"
+          echo " • You can try a minimal payload with only this rule if merge fails"
+
+          exit 1
+
+        # Docs: Origin Rules via Rulesets API (phase http_request_origin).
+        # https://developers.cloudflare.com/rules/origin-rules/create-api/
