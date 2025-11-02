@@ -391,74 +391,126 @@ jobs:
           exit 1
 
       # --- Ensure DNS — www CNAME to apex (proxied placeholder) ---
-      # ⚠️ FOR R2 + ORIGIN RULE HOSTING:
-      # Cloudflare requires DNS records to exist AND be proxied before Origin Rules apply.
-      # This CNAME is a "proxy trigger" only — real routing happens in the Origin Rule to R2.
-      #
-      # 🤓 What this does:
-      #   www.interwebshack.com  -> proxied CNAME -> interwebshack.com
-      #   Cloudflare catches it and forwards to R2 instead of resolving apex physically.
-      #
-      # ✅ This record does NOT get "updated later" — it stays as a placeholder.
-      # ✅ Do NOT point this to a real origin. R2 has no IP origin.
-      # ✅ If you don't like placeholder routing, use Workers or Pages instead.
-      - name: Ensure DNS — www CNAME to apex (proxied placeholder)
+      # If R2 custom-domain already created a www CNAME to *.r2.dev, we KEEP it and skip.
+      # Otherwise we ensure www -> CNAME apex (proxied) so Origin Rules can attach.
+      - name: Ensure DNS — www CNAME (respect R2-managed)
         shell: bash
         run: |
           set -euo pipefail
 
           ZONE_ID="${{ steps.zone.outputs.zone_id }}"
           HOST="www"
+          FQDN="${HOST}.${ZONE_NAME}"
           TARGET="${ZONE_NAME}"
 
-          echo "🌐 Ensuring DNS CNAME exists for www"
-          echo "📛 Host: ${HOST}.${ZONE_NAME}"
-          echo "🎯 Target: ${TARGET}"
-          echo "⛅ Mode: Proxied (required for Origin Rule)"
+          echo "🌐 Ensuring DNS CNAME for: ${FQDN}"
+          echo "🎯 Desired target: ${TARGET}"
+          echo "⛅ Desired mode: proxied"
           echo "🧭 Zone ID: ${ZONE_ID}"
-          echo "📝 Purpose: Proxy entry point — Origin Rule rewrites to R2 bucket"
 
-          payload=$(jq -n \
+          # 1) Look up existing CNAME(s) for www
+          list_resp=$(curl -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=CNAME&name=${FQDN}&per_page=1000")
+
+          list_ok=$(echo "$list_resp" | jq -r '.success')
+          if [[ "$list_ok" != "true" ]]; then
+            echo "❌ Failed to list existing CNAMEs for ${FQDN}"
+            echo "$list_resp" | jq . 2>/dev/null || echo "$list_resp"
+            exit 1
+          fi
+
+          count=$(echo "$list_resp" | jq '.result | length')
+          echo "🔎 Existing CNAME count for ${FQDN}: $count"
+
+          if [[ "$count" -gt 0 ]]; then
+            # There is at least one CNAME
+            # Check if any is R2-managed (content ends with .r2.dev)
+            r2_managed=$(echo "$list_resp" | jq -r '.result[]?.content | select(test("\\.r2\\.dev$")) | . ' | wc -l | tr -d ' ')
+            if [[ "$r2_managed" -gt 0 ]]; then
+              echo "🛡️ Found R2-managed CNAME (→ *.r2.dev). Keeping it and skipping changes."
+              echo "✅ www already routed by R2 custom-domain. No action needed."
+              exit 0
+            fi
+
+            # Not R2-managed. See if one already matches apex + proxied=true
+            matching=$(echo "$list_resp" | jq --arg tgt "$TARGET" -r '
+              .result[] | select(.content == $tgt and .proxied == true) | .id
+            ')
+            if [[ -n "$matching" ]]; then
+              echo "ℹ️ CNAME already points to apex and is proxied (id=$matching)."
+              echo "✅ No change required."
+              exit 0
+            fi
+
+            # Otherwise, PATCH the first record to desired state
+            record_id=$(echo "$list_resp" | jq -r '.result[0].id')
+            echo "🛠️ Updating existing CNAME id=${record_id} to target=${TARGET} (proxied=true)"
+
+            patch_payload=$(jq -n \
+              --arg type "CNAME" \
+              --arg name "${HOST}" \
+              --arg content "${TARGET}" \
+              --argjson proxied true \
+              '{type:$type,name:$name,content:$content,proxied:$proxied}')
+
+            echo "📦 PATCH payload:"
+            echo "$patch_payload" | jq .
+
+            patch_resp=$(curl -sS -w "\n%{http_code}" -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${record_id}" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$patch_payload" || true)
+
+            patch_body=$(echo "$patch_resp" | sed '$d')
+            patch_status=$(echo "$patch_resp" | tail -n1)
+
+            echo "📡 PATCH HTTP Status: $patch_status"
+            if [[ "$(echo "$patch_body" | jq -r '.success')" == "true" ]]; then
+              echo "✅ Updated www CNAME successfully."
+              exit 0
+            else
+              echo "❌ Failed to update existing CNAME"
+              echo "$patch_body" | jq . 2>/dev/null || echo "$patch_body"
+              exit 1
+            fi
+          fi
+
+          # 2) No existing CNAME: create desired one (unless R2 will manage it)
+          echo "🆕 Creating new CNAME: ${FQDN} → ${TARGET} (proxied=true)"
+
+          post_payload=$(jq -n \
             --arg type "CNAME" \
             --arg name "${HOST}" \
             --arg content "${TARGET}" \
             --argjson proxied true \
             '{type:$type,name:$name,content:$content,proxied:$proxied}')
 
-          echo "📦 Payload:"
-          echo "$payload" | jq .
+          echo "📦 POST payload:"
+          echo "$post_payload" | jq .
 
-          response=$(curl -sS -w "\n%{http_code}" -X POST \
+          post_resp=$(curl -sS -w "\n%{http_code}" -X POST \
             "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data "$payload" || true)
+            --data "$post_payload" || true)
 
-          body=$(echo "$response" | sed '$d')
-          http_status=$(echo "$response" | tail -n1)
+          post_body=$(echo "$post_resp" | sed '$d')
+          post_status=$(echo "$post_resp" | tail -n1)
 
-          echo "📡 HTTP Status: $http_status"
-
-          success=$(echo "$body" | jq -r '.success')
-
-          if [[ "$success" == "true" ]]; then
-            echo "✅ www CNAME created (proxied placeholder, Origin Rule will route to R2)"
+          echo "📡 POST HTTP Status: $post_status"
+          if [[ "$(echo "$post_body" | jq -r '.success')" == "true" ]]; then
+            echo "✅ Created www CNAME (proxied) successfully."
             exit 0
           fi
 
-          # Cloudflare error: record already exists
-          if echo "$body" | jq -r '.errors[]?.code // empty' | grep -q "81057"; then
-            echo "ℹ️ CNAME already exists — OK (idempotent)"
+          # Handle "already exists" gracefully (race or pre-existing)
+          if echo "$post_body" | jq -r '.errors[]?.code // empty' | grep -q "81053"; then
+            echo "ℹ️ Record already exists (81053). This is OK; step is idempotent."
             exit 0
           fi
 
-          echo "❌ Failed to ensure www CNAME"
-          echo "$body" | jq . 2>/dev/null || echo "$body"
-
-          echo "🛠 Suggestions:"
-          echo " • Check zone/domain spelling"
-          echo " • Ensure 'DNS: Edit' permission on API token"
-          echo " • Ensure cleanup step isn't deleting CNAME before check"
-          echo " • If you are using R2-managed DNS, this record may already exist"
-
+          echo "❌ Failed to create www CNAME"
+          echo "$post_body" | jq . 2>/dev/null || echo "$post_body"
           exit 1
