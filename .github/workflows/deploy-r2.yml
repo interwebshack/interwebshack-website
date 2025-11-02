@@ -199,7 +199,7 @@ jobs:
       # Docs: Public buckets & custom domains.
       # https://developers.cloudflare.com/r2/buckets/public-buckets/
 
-      # --- Clean existing DNS records for managed hostnames (idempotent & verbose) ---
+      # --- Clean existing DNS records for managed hostnames (skip R2-managed)(idempotent & verbose) ---
       - name: Clean DNS records for root + www
         shell: bash
         env:
@@ -215,7 +215,19 @@ jobs:
           echo "🧹 Preparing to clean DNS records in zone: $ZONE_ID"
           echo "🔧 Managed hostnames: $MANAGED_HOSTNAMES"
           echo "🧪 Dry run mode: $CF_DRY_RUN (0=delete, 1=preview only)"
+          echo "🚫 Skip records auto-managed by R2 (CNAME → *.r2.dev)"
           echo "🚨 Allow critical (MX/NS) deletion: $ALLOW_CRITICAL (0=no, 1=yes)"
+
+          # Helper: Determines if record is managed.
+          is_r2_managed() {
+            # Args: TYPE NAME CONTENT
+            local t="$1" n="$2" c="$3"
+            # R2 custom-domain creates a proxied CNAME whose content ends with r2.dev
+            if [[ "$t" == "CNAME" && "$c" =~ \.r2\.dev$ ]]; then
+              return 0
+            fi
+            return 1
+          }
 
           # Helper: delete all records for a given name
           delete_for_name() {
@@ -242,39 +254,43 @@ jobs:
               return 0
             fi
 
-            # Show a table of what we plan to delete
             echo "🧾 Current records:"
             echo "$resp" | jq -r '
               .result[] | [.id, .type, .name, (.content|tostring), (if .proxied then "proxied" else "dns-only" end), (."ttl"|tostring)]
               | @tsv
             ' | awk -F'\t' 'BEGIN{printf("  %-37s %-6s %-35s %-40s %-10s %-6s\n","ID","TYPE","NAME","CONTENT","PROXY","TTL")} {printf("  %-37s %-6s %-35s %-40s %-10s %-6s\n",$1,$2,$3,$4,$5,$6)}'
 
-            # Filter which records to delete
-            if [[ "$ALLOW_CRITICAL" == "1" ]]; then
-              filter='.result[]'
-            else
-              # Exclude NS/MX by default (safer)
-              filter='.result[] | select(.type != "NS" and .type != "MX")'
-            fi
-
-            # Collect IDs to delete
-            mapfile -t ids < <(echo "$resp" | jq -r "${filter} | .id")
+            # Build list of deletable IDs (exclude NS/MX unless allowed; exclude *.r2.dev CNAMEs)
+            mapfile -t ids < <(
+              echo "$resp" | jq -r '
+                .result[]
+                | select('"$([ "$ALLOW_CRITICAL" = "1" ] && echo 'true' || echo '.type != "NS" and .type != "MX"') "'
+                ')
+                | [.id, .type, .name, (.content|tostring)] | @tsv
+              ' | while IFS=$'\t' read -r id type rname content; do
+                    if is_r2_managed "$type" "$rname" "$content"; then
+                      echo "🛡️  Skipping R2-managed record (will not delete): type=$type name=$rname content=$content" >&2
+                      continue
+                    fi
+                    echo "$id"
+                  done
+            )
 
             if [[ "${#ids[@]}" -eq 0 ]]; then
-              echo "🛡️ No deletable records found for ${name} with current safety filters."
+              echo "🛡️ No deletable records for ${name} after safety filters."
               return 0
             fi
 
-            echo "🗑️  Will delete ${#ids[@]} record(s) for ${name}:"
-            echo "$resp" | jq -r "${filter} | [ .id, .type, .name, (.content|tostring) ] | @tsv" \
-              | awk -F'\t' '{printf("  id=%s type=%-5s name=%-35s content=%s\n",$1,$2,$3,$4)}'
+            echo "🗑️  Will delete ${#ids[@]} record(s) for ${name} (excluding R2-managed):"
+            for id in "${ids[@]}"; do
+              echo "  id=$id"
+            done
 
             if [[ "$CF_DRY_RUN" == "1" ]]; then
               echo "🧪 Dry run enabled — not deleting."
               return 0
             fi
 
-            # Delete each record verbosely
             for id in "${ids[@]}"; do
               echo "➡️  Deleting record id=${id} ..."
               del_resp=$(curl -sS -X DELETE \
@@ -285,6 +301,11 @@ jobs:
               if [[ "$del_ok" == "true" ]]; then
                 echo "   ✅ Deleted id=${id}"
               else
+                code=$(echo "$del_resp" | jq -r '.errors[0]?.code // empty')
+                if [[ "$code" == "1052" ]]; then
+                  echo "   🛡️  Skip: Record is auto-managed by Cloudflare (R2). Not deletable via DNS API."
+                  continue
+                fi
                 echo "   ❌ Failed to delete id=${id}"
                 echo "$del_resp" | jq . 2>/dev/null || echo "$del_resp"
                 exit 1
@@ -294,7 +315,6 @@ jobs:
             echo "✅ Completed deletions for ${name}"
           }
 
-          # Loop over requested hostnames
           for host in $MANAGED_HOSTNAMES; do
             delete_for_name "$host"
           done
