@@ -38,8 +38,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -d "$SITE_DIR" || { echo "Expected ./$SITE_DIR"; exit 1; }
-          test -f "$SITE_DIR/$INDEX_OBJECT" || { echo "Expected ./$SITE_DIR/$INDEX_OBJECT"; exit 1; }
+
+          echo "🔍 Verifying site build output exists"
+          echo "📁 SITE_DIR       = $SITE_DIR"
+          echo "📄 INDEX_OBJECT   = $INDEX_OBJECT"
+
+          if [[ ! -d "$SITE_DIR" ]]; then
+            echo "❌ Expected directory ./$SITE_DIR but it does not exist."
+            echo "   This usually means your build step didn't output to the correct folder."
+            exit 1
+          fi
+
+
+          if [[ ! -f "$SITE_DIR/$INDEX_OBJECT" ]]; then
+            echo "❌ Expected file ./$SITE_DIR/$INDEX_OBJECT but it was not found."
+            echo "   Check your build command and output path."
+            exit 1
+          fi
+
+          echo "✅ Site directory and entry file verified"
 
       # --- Get zone_id for interwebshack.com ---
       - name: Resolve Cloudflare zone_id
