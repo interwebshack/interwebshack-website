@@ -438,7 +438,7 @@ jobs:
       # • Works on all plans, no “entitlement” surprises
       # • Clear behavior: only apex redirects; www is served by R2 (R2-managed CNAME)
       # • Logs + routes are visible in Wrangler output
-      - name: Deploy Worker: redirect apex → www (301)
+      - name: Deploy Worker redirect apex → www (301)
         shell: bash
         run: |
           set -euo pipefail
