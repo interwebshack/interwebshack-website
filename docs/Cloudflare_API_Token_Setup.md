@@ -18,6 +18,8 @@ Add the following permissions to the token:
 | **Account**           | **Workers R2 Storage**                       | Edit             | Create/manage R2 buckets and uploads                   |
 | **Account**           | **Transform Rules**                          | Edit             | Manage zone rules needed for routing and automation    |
 | **Zone**              | **DNS**                                      | Edit             | Create and update DNS records automatically            |
+| **Zone**              | **Origin Rules**                             | Edit             | Create/modify Origin Rules for R2 routing              |
+| **Zone**              | **Transform Rules**                          | Edit             | Create/modify Transform Rules for R2 ting              |
 | **Zone**              | **Zone**                                     | Read             | Required for looking up zone details during deployment |
 
 ## 3. Assign Account Resources
