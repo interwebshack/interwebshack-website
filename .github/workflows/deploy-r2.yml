@@ -47,11 +47,48 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          zone_json=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+
+          echo "🔍 Fetching Cloudflare Zone ID for: $ZONE_NAME"
+
+          # Make API request
+          response=$(curl -sS -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             "https://api.cloudflare.com/client/v4/zones?name=${ZONE_NAME}")
-          ok=$(echo "$zone_json" | jq -r '.success')
-          test "$ok" = "true"
-          zone_id=$(echo "$zone_json" | jq -r '.result[0].id')
+
+          # Split body and HTTP status
+          body=$(echo "$response" | sed '$d')
+          http_status=$(echo "$response" | tail -n1)
+
+          echo "📡 Cloudflare API HTTP status: $http_status"
+
+          # If Cloudflare returned error
+          if [[ "$http_status" -ne 200 ]]; then
+            echo "❌ Error: Cloudflare API returned HTTP $http_status"
+            echo "Response body:"
+            echo "$body" | jq .
+            exit 1
+          fi
+
+          success=$(echo "$body" | jq -r '.success')
+          if [[ "$success" != "true" ]]; then
+            echo "❌ Cloudflare returned success=false"
+            echo "$body" | jq .
+            exit 1
+          fi
+
+          zone_count=$(echo "$body" | jq '.result | length')
+          if [[ "$zone_count" -eq 0 ]]; then
+            echo "❌ No zones found matching: $ZONE_NAME"
+            exit 1
+          fi
+
+          zone_id=$(echo "$body" | jq -r '.result[0].id')
+          zone_name=$(echo "$body" | jq -r '.result[0].name')
+
+          echo "✅ Found zone: $zone_name"
+          echo "🔑 Zone ID: $zone_id"
+
           echo "zone_id=$zone_id" >> "$GITHUB_OUTPUT"
+
         # Docs: List Zones (get zone_id). 
         # https://developers.cloudflare.com/api/resources/zones/methods/list/
